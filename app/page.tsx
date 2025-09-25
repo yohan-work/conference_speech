@@ -62,6 +62,8 @@ export default function Home() {
   const [environmentStatus, setEnvironmentStatus] = useState<
     "quiet" | "noisy" | "very_noisy"
   >("quiet");
+  const [reconnectAttempts, setReconnectAttempts] = useState(0);
+  const [lastActivity, setLastActivity] = useState<number>(Date.now());
 
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const summarizerRef = useRef<any>(null);
@@ -69,6 +71,8 @@ export default function Home() {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const microphoneRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const animationRef = useRef<number | null>(null);
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const activityCheckRef = useRef<NodeJS.Timeout | null>(null);
 
   // 음성 인식 초기화
   useEffect(() => {
@@ -82,16 +86,24 @@ export default function Home() {
         recognition.interimResults = true;
         recognition.lang = "ko-KR";
 
-        // 음성 인식 민감도 향상을 위한 추가 설정
+        // 음성 인식 안정성 및 성능 향상을 위한 설정
         if ("maxAlternatives" in recognition) {
-          (recognition as any).maxAlternatives = 1;
+          (recognition as any).maxAlternatives = 3;
         }
         if ("serviceURI" in recognition) {
           (recognition as any).serviceURI =
             "wss://www.google.com/speech-api/full-duplex/v1/up";
         }
+        // 긴 발화 처리를 위한 추가 설정
+        if ("grammars" in recognition) {
+          (recognition as any).grammars = null; // 문법 제한 해제
+        }
 
         recognition.onresult = (event: SpeechRecognitionEvent) => {
+          // 활동 시간 업데이트
+          setLastActivity(Date.now());
+          setReconnectAttempts(0);
+
           let finalTranscript = "";
           let interimTranscript = "";
 
@@ -125,25 +137,77 @@ export default function Home() {
         };
 
         recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-          setError(`음성 인식 오류: ${event.error}`);
-          setIsRecording(false);
+          console.log("음성 인식 오류:", event.error, event.message);
+
+          // 일시적 오류인 경우 재시도
+          if (
+            event.error === "network" ||
+            event.error === "audio-capture" ||
+            event.error === "aborted"
+          ) {
+            setReconnectAttempts((prev) => prev + 1);
+            if (reconnectAttempts < 5) {
+              // 최대 5회 재시도
+              setError(
+                `연결 문제 발생, 재시도 중... (${reconnectAttempts + 1}/5)`
+              );
+              // 지수 백오프로 재시도 간격 증가
+              const delay = Math.min(
+                1000 * Math.pow(2, reconnectAttempts),
+                10000
+              );
+              reconnectTimeoutRef.current = setTimeout(() => {
+                if (isRecording && recognitionRef.current) {
+                  try {
+                    recognitionRef.current.start();
+                  } catch (err) {
+                    console.log("재시도 실패:", err);
+                  }
+                }
+              }, delay);
+              return;
+            }
+          }
+
+          setError(
+            `음성 인식 오류: ${event.error} - ${
+              event.message || "알 수 없는 오류"
+            }`
+          );
+          if (
+            event.error === "not-allowed" ||
+            event.error === "service-not-allowed"
+          ) {
+            setIsRecording(false);
+          }
         };
 
         recognition.onend = () => {
+          setIsListening(false);
+
           // 녹음 중이었다면 자동으로 재시작 (연결이 끊어진 경우)
           if (isRecording) {
-            setTimeout(() => {
-              if (recognitionRef.current && isRecording) {
-                try {
-                  recognitionRef.current.start();
-                  setIsListening(true);
-                } catch (err) {
-                  console.log("재시작 시도 중 오류:", err);
+            const timeSinceLastActivity = Date.now() - lastActivity;
+
+            // 최근 활동이 있었거나 재연결 시도가 5회 미만인 경우에만 재시작
+            if (timeSinceLastActivity < 30000 && reconnectAttempts < 5) {
+              const delay = Math.min(500 + reconnectAttempts * 200, 2000);
+
+              reconnectTimeoutRef.current = setTimeout(() => {
+                if (recognitionRef.current && isRecording) {
+                  try {
+                    recognitionRef.current.start();
+                    setIsListening(true);
+                  } catch (err) {
+                    console.log("재시작 시도 중 오류:", err);
+                    setReconnectAttempts((prev) => prev + 1);
+                  }
                 }
-              }
-            }, 100);
-          } else {
-            setIsListening(false);
+              }, delay);
+            } else {
+              setError("음성 인식이 중단되었습니다. 다시 시작해주세요.");
+              setIsRecording(false);
+            }
           }
         };
 
@@ -162,8 +226,54 @@ export default function Home() {
     // 컴포넌트 언마운트 시 정리
     return () => {
       cleanupMicrophoneMonitoring();
+      cleanupReconnection();
     };
   }, []);
+
+  // 활동 모니터링 (30초마다 체크)
+  useEffect(() => {
+    if (isRecording) {
+      activityCheckRef.current = setInterval(() => {
+        const timeSinceLastActivity = Date.now() - lastActivity;
+
+        // 30초 이상 활동이 없으면 경고
+        if (timeSinceLastActivity > 30000) {
+          console.log("장시간 비활성 상태 감지");
+          setError("음성 인식이 비활성 상태입니다. 말씀해 주세요.");
+        }
+
+        // 60초 이상 활동이 없으면 재시작 시도
+        if (timeSinceLastActivity > 60000 && reconnectAttempts < 3) {
+          console.log("장시간 비활성으로 인한 재시작 시도");
+          if (recognitionRef.current) {
+            try {
+              recognitionRef.current.stop();
+              setTimeout(() => {
+                if (recognitionRef.current && isRecording) {
+                  recognitionRef.current.start();
+                  setLastActivity(Date.now());
+                }
+              }, 1000);
+            } catch (err) {
+              console.log("비활성 재시작 실패:", err);
+            }
+          }
+        }
+      }, 10000); // 10초마다 체크
+    } else {
+      if (activityCheckRef.current) {
+        clearInterval(activityCheckRef.current);
+        activityCheckRef.current = null;
+      }
+    }
+
+    return () => {
+      if (activityCheckRef.current) {
+        clearInterval(activityCheckRef.current);
+        activityCheckRef.current = null;
+      }
+    };
+  }, [isRecording, lastActivity, reconnectAttempts]);
 
   // 요약 모델 초기화 (한국어 지원 개선)
   useEffect(() => {
@@ -277,10 +387,27 @@ export default function Home() {
     setEnvironmentStatus("quiet");
   };
 
+  // 재연결 관련 정리
+  const cleanupReconnection = () => {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    if (activityCheckRef.current) {
+      clearInterval(activityCheckRef.current);
+      activityCheckRef.current = null;
+    }
+  };
+
   const startRecording = async () => {
     if (recognitionRef.current && !isRecording) {
       setError("");
       setIsRecording(true);
+      setReconnectAttempts(0);
+      setLastActivity(Date.now());
+
+      // 이전 타이머들 정리
+      cleanupReconnection();
 
       // 마이크 모니터링 시작
       await setupMicrophoneMonitoring();
@@ -292,6 +419,7 @@ export default function Home() {
         setError("음성 인식을 시작할 수 없습니다. 잠시 후 다시 시도해주세요.");
         setIsRecording(false);
         cleanupMicrophoneMonitoring();
+        cleanupReconnection();
       }
     }
   };
@@ -301,9 +429,11 @@ export default function Home() {
       recognitionRef.current.stop();
       setIsRecording(false);
       setIsListening(false);
+      setReconnectAttempts(0);
 
-      // 마이크 모니터링 정리
+      // 모든 모니터링 정리
       cleanupMicrophoneMonitoring();
+      cleanupReconnection();
     }
   };
 
@@ -508,6 +638,8 @@ export default function Home() {
     setSummary("");
     setKeywords([]);
     setError("");
+    setReconnectAttempts(0);
+    setLastActivity(Date.now());
   };
 
   return (
@@ -541,10 +673,17 @@ export default function Home() {
               <span className="text-sm text-gray-600">
                 {isRecording
                   ? isListening
-                    ? "🎤 음성 인식 중..."
-                    : "🔄 연결 중..."
-                  : "⏸️ 대기 중"}
+                    ? "음성 인식 중..."
+                    : reconnectAttempts > 0
+                    ? `재연결 중... (${reconnectAttempts}/5)`
+                    : "연결 중..."
+                  : "대기 중"}
               </span>
+              {reconnectAttempts > 0 && isRecording && (
+                <span className="text-xs text-orange-600">
+                  연결 안정성 개선 중
+                </span>
+              )}
             </div>
 
             {/* 마이크 볼륨 표시 */}
