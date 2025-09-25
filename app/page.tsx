@@ -95,9 +95,6 @@ export default function Home() {
             "wss://www.google.com/speech-api/full-duplex/v1/up";
         }
         // 긴 발화 처리를 위한 추가 설정
-        if ("grammars" in recognition) {
-          (recognition as any).grammars = null; // 문법 제한 해제
-        }
 
         recognition.onresult = (event: SpeechRecognitionEvent) => {
           // 활동 시간 업데이트
